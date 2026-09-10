@@ -33,6 +33,7 @@ function collection(value: unknown): Array<[string, unknown]> | undefined {
 const aliases: Record<DatasetName, readonly [string, readonly string[]][]> = {
   ships: [
     ['id', ['id', 'shipId', 'ship_id', 'apiId', 'api_id']],
+    ['shipId', ['shipId', 'ship_id', 'api_ship_id']],
     ['name', ['name', 'shipName', 'api_name']],
     ['type', ['type', 'typeId', 'type_id', 'api_stype']],
     ['level', ['level', 'lv', 'api_lv']],
@@ -48,17 +49,18 @@ const aliases: Record<DatasetName, readonly [string, readonly string[]][]> = {
   ],
   equipment: [
     ['id', ['id', 'equipmentId', 'equipment_id', 'apiId', 'api_id']],
+    ['slotitemId', ['slotitemId', 'slotitem_id', 'api_slotitem_id']],
     ['name', ['name', 'equipmentName', 'api_name']],
     ['type', ['type', 'typeId', 'type_id', 'api_type']],
     ['level', ['level', 'lv', 'api_level']],
     ['rarity', ['rarity', 'api_rare']],
-    ['icon', ['icon', 'api_type']],
+    ['icon', ['icon', 'api_icon']],
   ],
   fleets: [
     ['id', ['id', 'fleetId', 'fleet_id', 'deckId', 'deck_id', 'api_id']],
     ['name', ['name', 'fleetName', 'api_name']],
     ['ships', ['ships', 'shipIds', 'ship_ids', 'api_ship']],
-    ['flagshipId', ['flagshipId', 'flagship_id']],
+    ['flagshipId', ['flagshipId', 'flagship_id', 'api_flagship']],
   ],
   resources: [
     ['id', ['id', 'resourceId', 'resource_id', 'apiId', 'api_id']],
@@ -70,7 +72,7 @@ const aliases: Record<DatasetName, readonly [string, readonly string[]][]> = {
   docks: [
     ['id', ['id', 'dockId', 'dock_id', 'slot', 'api_id']],
     ['kind', ['kind', 'type']],
-    ['shipId', ['shipId', 'ship_id', 'api_ship_id']],
+    ['shipId', ['shipId', 'ship_id', 'api_ship_id', 'api_created_ship_id']],
     ['state', ['state', 'status', 'api_state']],
     [
       'completeTime',
@@ -90,6 +92,7 @@ function projectItem(
   dataset: DatasetName,
   key: string,
   value: unknown,
+  root: PlainRecord,
 ): { [key: string]: JsonValue } {
   const result: { [key: string]: JsonValue } = {}
   if (isRecord(value)) {
@@ -103,8 +106,45 @@ function projectItem(
       }
     }
   }
+  if (dataset === 'ships') {
+    const master = lookupMaster(root, ['$ships'], result.shipId)
+    if (result.name === undefined) {
+      const name = scalar(master?.api_name)
+      if (name !== undefined) result.name = name
+    }
+    if (result.type === undefined) {
+      const type = scalar(master?.api_stype)
+      if (type !== undefined) result.type = type
+    }
+  } else if (dataset === 'equipment') {
+    const master = lookupMaster(root, ['$equips'], result.slotitemId)
+    if (result.name === undefined) {
+      const name = scalar(master?.api_name)
+      if (name !== undefined) result.name = name
+    }
+    if (result.type === undefined) {
+      const type = scalar(master?.api_type)
+      if (type !== undefined) result.type = type
+    }
+    if (result.rarity === undefined) {
+      const rarity = scalar(master?.api_rare)
+      if (rarity !== undefined) result.rarity = rarity
+    }
+  }
   if (result.id === undefined) result.id = key
   return result
+}
+
+function lookupMaster(
+  root: PlainRecord,
+  path: readonly string[],
+  id: JsonValue | undefined,
+): PlainRecord | undefined {
+  if (typeof id !== 'string' && typeof id !== 'number') return undefined
+  const group = atPath(root, ['const', ...path])
+  if (!isRecord(group)) return undefined
+  const value = group[String(id)]
+  return isRecord(value) ? value : undefined
 }
 
 function resolveSimple(
@@ -216,7 +256,7 @@ export function snapshotFor(dataset: DatasetName, state: unknown): DatasetSnapsh
     dataset,
     available: entries !== undefined,
     partial: entries === undefined,
-    items: entries?.map(([key, value]) => projectItem(dataset, key, value)) ?? [],
+    items: entries?.map(([key, value]) => projectItem(dataset, key, value, root)) ?? [],
   }
 }
 

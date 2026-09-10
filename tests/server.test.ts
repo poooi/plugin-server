@@ -81,17 +81,24 @@ function fixture(): { state: unknown; store: Store; config: Config; host: Plugin
   const store = new Store({
     info: {
       ships: {
-        '1': { api_id: 1, api_name: 'Fubuki', api_lv: 12, api_nowhp: 18, secret: 'private' },
+        '1': {
+          api_id: 1,
+          api_ship_id: 1,
+          api_lv: 12,
+          api_nowhp: 18,
+          secret: 'private',
+        },
       },
-      equips: { '2': { api_id: 2, api_name: 'Gun', api_level: 3 } },
-      fleets: [{ api_id: 1, api_name: 'First Fleet', api_ship: [1] }],
+      equips: { '2': { api_id: 2, api_slotitem_id: 2, api_locked: 0, api_level: 3 } },
+      fleets: [{ api_id: 1, api_name: 'First Fleet', api_ship: [1], api_flagship: '0' }],
       resources: [321, 123],
       repairs: [{ api_id: 1, api_ship_id: 1, api_state: 1 }],
-      constructions: [{ api_id: 1, api_state: 2 }],
+      constructions: [{ api_id: 1, api_created_ship_id: 2, api_state: 2 }],
     },
     const: {
       $shipTypes: { '1': { api_id: 1, api_name: 'Destroyer' } },
       $ships: { '1': { api_id: 1, api_name: 'Fubuki', api_stype: 1 } },
+      $equips: { '2': { api_id: 2, api_name: 'Gun', api_type: [1, 2, 3], api_rare: 4 } },
     },
   })
   const config = new Config()
@@ -208,8 +215,20 @@ describe('built poi plugin entry over real loopback HTTP', () => {
     ])
     const ships = await request(port, '/api/v1/data/ships', token)
     expect(ships.status).toBe(200)
-    expect(ships.body.items).toEqual([{ id: 1, name: 'Fubuki', level: 12, hp: 18 }])
+    expect(ships.body.items).toEqual([
+      { id: 1, shipId: 1, name: 'Fubuki', type: 1, level: 12, hp: 18 },
+    ])
     expect(ships.body).not.toHaveProperty('secret')
+    expect((await request(port, '/api/v1/data/equipment', token)).body.items).toEqual([
+      { id: 2, slotitemId: 2, name: 'Gun', type: [1, 2, 3], level: 3, rarity: 4 },
+    ])
+    expect((await request(port, '/api/v1/data/fleets', token)).body.items).toEqual([
+      { id: 1, name: 'First Fleet', ships: [1], flagshipId: '0' },
+    ])
+    expect((await request(port, '/api/v1/data/docks', token)).body.items).toEqual([
+      { id: 1, kind: 'repair', shipId: 1, state: 1 },
+      { id: 1, kind: 'construction', shipId: 2, state: 2 },
+    ])
     store.update({ ships: [{ id: 1, name: 'Fubuki', level: 13 }] })
     expect((await request(port, '/api/v1/data/ships', token)).body.items).toEqual([
       { id: 1, name: 'Fubuki', level: 13 },
@@ -282,14 +301,15 @@ describe('built projection and settings entry', () => {
   it('keeps secrets out of allowlisted projection and maps real poi slices', () => {
     expect(
       snapshotFor('ships', {
-        info: { ships: { '7': { api_id: 7, api_name: 'Mutsuki', api_lv: 4, token: 'private' } } },
+        info: { ships: { '7': { api_id: 7, api_ship_id: 17, api_lv: 4, token: 'private' } } },
+        const: { $ships: { '17': { api_id: 17, api_name: 'Mutsuki', api_stype: 2 } } },
       }),
     ).toEqual({
       schemaVersion: 1,
       dataset: 'ships',
       available: true,
       partial: false,
-      items: [{ id: 7, name: 'Mutsuki', level: 4 }],
+      items: [{ id: 7, shipId: 17, name: 'Mutsuki', type: 2, level: 4 }],
     })
     expect(
       snapshotFor('masterData', {
