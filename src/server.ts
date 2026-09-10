@@ -1,6 +1,8 @@
 import { timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { isIP } from 'node:net'
+import type { Duplex } from 'node:stream'
+import { WebSocket, WebSocketServer } from 'ws'
 import { allSnapshots, snapshotFor } from './projection'
 import {
   DATASET_NAMES,
@@ -12,6 +14,10 @@ import {
 
 const MAX_URL_LENGTH = 2048
 const MAX_CONTENT_LENGTH = 8192
+const MAX_WS_INCOMING_BYTES = 8192
+const MAX_WS_MESSAGE_BYTES = 1024 * 1024
+const MAX_WS_BUFFERED_BYTES = 1024 * 1024
+const WS_PATH = '/api/v1/subscribe'
 
 function isDataset(value: string): value is DatasetName {
   return (DATASET_NAMES as readonly string[]).includes(value)
@@ -107,11 +113,33 @@ function authMatches(request: IncomingMessage, token: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected)
 }
 
+function hasUrlCredential(parsedUrl: URL): boolean {
+  return ['token', 'access_token', 'authorization', 'auth'].some((key) =>
+    parsedUrl.searchParams.has(key),
+  )
+}
+
+function rejectUpgrade(socket: Duplex, status: number, message: string): void {
+  const payload = `${message}\n`
+  socket.write(
+    `HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload}`,
+  )
+  socket.destroy()
+}
+
 export class JsonServer {
   private server: Server | null = null
+  private readonly websocketServer = new WebSocketServer({
+    noServer: true,
+    clientTracking: false,
+    maxPayload: MAX_WS_INCOMING_BYTES,
+    perMessageDeflate: false,
+  })
+  private readonly sockets = new Set<WebSocket>()
   private unsubscribe: (() => void) | null = null
   private lifecycle: Promise<void> = Promise.resolve()
   private revision = 0
+  private lastSnapshotJson: string
   private _status: ServerStatus
 
   constructor(
@@ -126,9 +154,9 @@ export class JsonServer {
       error: null,
       revision: 0,
     }
+    this.lastSnapshotJson = JSON.stringify(allSnapshots(host.store.getState()))
     this.unsubscribe = host.store.subscribe(() => {
-      this.revision += 1
-      this._status.revision = this.revision
+      this.publishIfChanged()
     })
   }
 
@@ -142,12 +170,14 @@ export class JsonServer {
 
   async reconfigure(settings: ServerSettings): Promise<void> {
     return this.enqueue(async () => {
+      const tokenChanged = this.settings.token !== settings.token
       const listenerChanged =
         this.settings.enabled !== settings.enabled ||
         this.settings.port !== settings.port ||
         this.settings.allowLan !== settings.allowLan
       this.settings = settings
       this._status = { ...this._status, configuredPort: settings.port }
+      if (tokenChanged) this.closeSockets()
       if (!listenerChanged && this.server && this._status.phase === 'running') return
       await this.stopNow()
       await this.startNow()
@@ -186,6 +216,7 @@ export class JsonServer {
       this.handle(request, response),
     )
     server.maxHeadersCount = 64
+    server.on('upgrade', (request, socket, head) => this.handleUpgrade(request, socket, head))
     server.on('error', (error: NodeJS.ErrnoException) => {
       this._status = {
         ...this._status,
@@ -235,6 +266,7 @@ export class JsonServer {
   private async stopNow(): Promise<void> {
     const server = this.server
     this.server = null
+    this.closeSockets()
     if (server) {
       server.closeAllConnections()
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -245,6 +277,77 @@ export class JsonServer {
       boundPort: null,
       address: null,
     }
+  }
+
+  private publishIfChanged(): void {
+    const datasets = allSnapshots(this.host.store.getState())
+    const snapshotJson = JSON.stringify(datasets)
+    if (snapshotJson === this.lastSnapshotJson) return
+    this.lastSnapshotJson = snapshotJson
+    this.revision += 1
+    this._status.revision = this.revision
+    this.broadcast(this.message('update', datasets))
+  }
+
+  private message(type: 'snapshot' | 'update', datasets: ReturnType<typeof allSnapshots>): string {
+    return JSON.stringify({ schemaVersion: 1, type, revision: this.revision, datasets })
+  }
+
+  private broadcast(payload: string): void {
+    for (const socket of this.sockets) this.send(socket, payload)
+  }
+
+  private send(socket: WebSocket, payload: string): void {
+    if (socket.readyState !== WebSocket.OPEN) return
+    const size = Buffer.byteLength(payload)
+    if (size > MAX_WS_MESSAGE_BYTES || socket.bufferedAmount > MAX_WS_BUFFERED_BYTES - size) {
+      socket.terminate()
+      return
+    }
+    socket.send(payload)
+  }
+
+  private closeSockets(): void {
+    for (const socket of this.sockets) socket.terminate()
+    this.sockets.clear()
+  }
+
+  private handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    if (!request.url || request.url.length > MAX_URL_LENGTH) {
+      rejectUpgrade(socket, 414, 'Request-URI Too Long')
+      return
+    }
+    const host = approvedHost(request.headers.host, this.settings)
+    if (!host || !approvedOrigin(request.headers.origin, host, this.settings)) {
+      rejectUpgrade(socket, 403, 'Forbidden')
+      return
+    }
+    let parsedUrl: URL
+    try {
+      parsedUrl = new URL(request.url, 'http://localhost')
+    } catch {
+      rejectUpgrade(socket, 400, 'Bad Request')
+      return
+    }
+    if (hasUrlCredential(parsedUrl) || parsedUrl.search || parsedUrl.hash) {
+      rejectUpgrade(socket, 400, 'Credentials in URL are not allowed')
+      return
+    }
+    if (parsedUrl.pathname !== WS_PATH) {
+      rejectUpgrade(socket, 404, 'Not Found')
+      return
+    }
+    if (!authMatches(request, this.settings.token)) {
+      rejectUpgrade(socket, 401, 'Unauthorized')
+      return
+    }
+    this.websocketServer.handleUpgrade(request, socket, head, (client) => {
+      this.sockets.add(client)
+      client.on('close', () => this.sockets.delete(client))
+      client.on('error', () => this.sockets.delete(client))
+      client.on('message', () => client.close(1008, 'This subscription is read-only.'))
+      this.send(client, this.message('snapshot', allSnapshots(this.host.store.getState())))
+    })
   }
 
   private handle(request: IncomingMessage, response: ServerResponse): void {
@@ -297,11 +400,7 @@ export class JsonServer {
       sendJson(response, 400, { error: 'invalid_request' }, origin)
       return
     }
-    if (
-      ['token', 'access_token', 'authorization', 'auth'].some((key) =>
-        parsedUrl.searchParams.has(key),
-      )
-    ) {
+    if (hasUrlCredential(parsedUrl)) {
       sendJson(response, 400, { error: 'token_in_url_not_allowed' }, origin)
       return
     }

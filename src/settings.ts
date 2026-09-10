@@ -15,12 +15,12 @@ export const SETTINGS_DESCRIPTOR: readonly SettingsDescriptor[] = [
   {
     key: 'enabled',
     label: 'Enable server',
-    description: 'Start the authenticated read-only JSON server when poi loads.',
+    description: 'Start the authenticated read-only JSON and WebSocket server when poi loads.',
   },
   {
     key: 'port',
     label: 'Port',
-    description: `TCP port (default ${DEFAULT_PORT}) used on loopback or LAN.`,
+    description: `TCP port (default ${DEFAULT_PORT}) used by JSON and WebSocket endpoints on loopback or LAN.`,
   },
   {
     key: 'allowLan',

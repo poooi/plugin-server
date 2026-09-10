@@ -3,6 +3,7 @@ import { createServer as createNetServer } from 'node:net'
 import { createElement } from 'react'
 import { act, create } from 'react-test-renderer'
 import { afterEach, describe, expect, it } from 'vitest'
+import WebSocket from 'ws'
 import {
   createPlugin,
   defaultSettings,
@@ -169,6 +170,87 @@ async function request(
   })
 }
 
+interface SocketQueue {
+  messages: Array<Record<string, unknown>>
+  waiters: Array<(message: Record<string, unknown>) => void>
+}
+
+const socketQueues = new WeakMap<WebSocket, SocketQueue>()
+const socketCloseCodes = new WeakMap<WebSocket, number>()
+
+function socketText(data: WebSocket.RawData): string {
+  if (typeof data === 'string') return data
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf8')
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8')
+  return Buffer.from(data).toString('utf8')
+}
+
+function connectSocket(
+  port: number,
+  token: string,
+  path = '/api/v1/subscribe',
+): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}${path}`, {
+      headers: {
+        Host: `127.0.0.1:${port}`,
+        Authorization: `Bearer ${token}`,
+      },
+    })
+    const queue: SocketQueue = { messages: [], waiters: [] }
+    socketQueues.set(socket, queue)
+    socket.on('close', (code: number) => socketCloseCodes.set(socket, code))
+    socket.on('message', (data: WebSocket.RawData) => {
+      try {
+        const message = JSON.parse(socketText(data)) as Record<string, unknown>
+        const waiter = queue.waiters.shift()
+        if (waiter) waiter(message)
+        else queue.messages.push(message)
+      } catch {
+        socket.terminate()
+      }
+    })
+    const onError = (error: Error): void => reject(error)
+    socket.once('error', onError)
+    socket.once('open', () => {
+      socket.off('error', onError)
+      resolve(socket)
+    })
+  })
+}
+
+function nextSocketMessage(socket: WebSocket): Promise<Record<string, unknown>> {
+  const queue = socketQueues.get(socket)
+  if (!queue) return Promise.reject(new Error('Socket queue is missing.'))
+  const message = queue.messages.shift()
+  if (message) return Promise.resolve(message)
+  return new Promise((resolve) => queue.waiters.push(resolve))
+}
+
+function socketClosed(socket: WebSocket): Promise<number> {
+  return new Promise((resolve) => {
+    if (socket.readyState === WebSocket.CLOSED) {
+      resolve(socketCloseCodes.get(socket) ?? 1006)
+      return
+    }
+    socket.once('close', (code: number) => resolve(code))
+  })
+}
+
+function noSocketMessage(socket: WebSocket, milliseconds: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (): void => {
+      clearTimeout(timer)
+      reject(new Error('unchanged state produced a WebSocket update'))
+    }
+    const timer = setTimeout(() => {
+      socket.off('message', onMessage)
+      resolve()
+    }, milliseconds)
+    socket.once('message', onMessage)
+  })
+}
+
 describe('built poi plugin entry over real loopback HTTP', () => {
   it('exercises the real zero-argument unawaited poi lifecycle hooks', async () => {
     const { store, config } = fixture()
@@ -294,6 +376,83 @@ describe('built poi plugin entry over real loopback HTTP', () => {
     await first.plugin.unload()
     await first.plugin.load()
     expect(first.plugin.getStatus().phase).toBe('running')
+  })
+})
+
+describe('built poi plugin entry over real loopback WebSocket', () => {
+  it('sends a shared snapshot and ordered changed projections from the host store', async () => {
+    const { store, token, port } = await makePlugin()
+    const first = await connectSocket(port, token)
+    const second = await connectSocket(port, token)
+    const firstSnapshot = await nextSocketMessage(first)
+    const secondSnapshot = await nextSocketMessage(second)
+    expect(firstSnapshot).toEqual(secondSnapshot)
+    expect(firstSnapshot).toMatchObject({ type: 'snapshot', revision: 0 })
+    expect(firstSnapshot.datasets).toMatchObject({
+      ships: { items: [{ id: 1, shipId: 1, name: 'Fubuki' }] },
+    })
+
+    store.update(store.state)
+    await noSocketMessage(first, 40)
+
+    store.update({
+      info: { ships: { '1': { api_id: 1, api_ship_id: 1, api_lv: 13, api_nowhp: 18 } } },
+      const: { $ships: { '1': { api_id: 1, api_name: 'Fubuki', api_stype: 1 } } },
+    })
+    const [firstUpdate, secondUpdate] = await Promise.all([
+      nextSocketMessage(first),
+      nextSocketMessage(second),
+    ])
+    expect(firstUpdate).toEqual(secondUpdate)
+    expect(firstUpdate).toMatchObject({
+      type: 'update',
+      revision: 1,
+      datasets: { ships: { items: [{ id: 1, level: 13 }] } },
+    })
+    first.close()
+    second.close()
+  })
+
+  it('rejects credentials before upgrade and closes read-only sessions on rotation', async () => {
+    const { plugin, token, port } = await makePlugin()
+    await expect(connectSocket(port, 'wrong-token')).rejects.toThrow('401')
+    await expect(connectSocket(port, token, `/api/v1/subscribe?token=${token}`)).rejects.toThrow(
+      '400',
+    )
+    const socket = await connectSocket(port, token)
+    await nextSocketMessage(socket)
+    const closed = socketClosed(socket)
+    const newToken = await plugin.rotateToken()
+    expect(await closed).not.toBe(1000)
+    await expect(connectSocket(port, token)).rejects.toThrow('401')
+    const replacement = await connectSocket(port, newToken)
+    expect((await nextSocketMessage(replacement)).type).toBe('snapshot')
+    const disabled = socketClosed(replacement)
+    await plugin.updateSettings({ enabled: false })
+    expect(await disabled).not.toBe(1000)
+    await plugin.updateSettings({ enabled: true })
+    const reloaded = await connectSocket(port, newToken)
+    await nextSocketMessage(reloaded)
+    const unloaded = socketClosed(reloaded)
+    await plugin.unload()
+    expect(await unloaded).not.toBe(1000)
+  })
+
+  it('validates the exact loopback Host and Origin during WebSocket upgrade', async () => {
+    const { token, port } = await makePlugin()
+    await expect(
+      new Promise<WebSocket>((resolve, reject) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${port}/api/v1/subscribe`, {
+          headers: {
+            Host: `127.0.0.1:${port}`,
+            Origin: `http://attacker.example:${port}`,
+            Authorization: `Bearer ${token}`,
+          },
+        })
+        socket.once('open', () => resolve(socket))
+        socket.once('error', reject)
+      }),
+    ).rejects.toThrow('403')
   })
 })
 

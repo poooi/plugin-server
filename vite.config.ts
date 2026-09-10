@@ -8,7 +8,7 @@ export default defineConfig({
       fileName: 'index',
     },
     rollupOptions: {
-      external: ['react', 'react/jsx-runtime', /^node:/],
+      external: ['react', 'react/jsx-runtime', 'ws', /^node:/],
     },
     sourcemap: true,
     target: 'node22',
