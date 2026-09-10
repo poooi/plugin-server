@@ -14,4 +14,4 @@ https://localhost {
 }
 ```
 
-The upstream `Host` and `Origin` are the exact loopback values validated by the plugin. The proxy's explicit downstream CORS rewrite makes the browser's original `https://localhost` origin usable; it is not a forwarded-header bypass. Forwarded headers remain untrusted, and every request still needs the bearer token. If the plugin port changes, update both the plugin setting and this upstream address.
+The upstream `Host` and `Origin` are the exact loopback values validated by the plugin. Caddy's `reverse_proxy` also carries WebSocket upgrades, so the same block serves `wss://localhost/api/v1/subscribe`; the client still sends `Authorization: Bearer <token>` in the handshake. The proxy's explicit downstream CORS rewrite makes the browser's original `https://localhost` origin usable for HTTP; it is not a forwarded-header bypass. Forwarded headers remain untrusted, and every request or upgrade still needs the bearer token. If the plugin port changes, update both the plugin setting and this upstream address.
