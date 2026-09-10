@@ -1,0 +1,51 @@
+{
+  "name": "poi-plugin-server",
+  "version": "0.2.0",
+  "description": "Authenticated read-only JSON access to poi data",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
+  "keywords": [
+    "poi-plugin",
+    "poi"
+  ],
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm run build && node scripts/run-built-tests.mjs",
+    "test:built": "node scripts/run-built-tests.mjs",
+    "package:smoke": "node scripts/package-smoke.mjs",
+    "check": "pnpm run format:check && pnpm run build && pnpm run lint && pnpm run typecheck && pnpm run test:built && pnpm run package:smoke"
+  },
+  "peerDependencies": {
+    "react": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "@types/react": "18.3.18",
+    "@types/react-test-renderer": "18.3.0",
+    "eslint": "9.39.5",
+    "prettier": "3.9.6",
+    "react": "18.3.1",
+    "react-test-renderer": "18.3.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.66.0",
+    "vite": "6.4.3",
+    "vitest": "2.1.9"
+  },
+  "poiPlugin": {
+    "title": "Read-only Server",
+    "description": "Authenticated read-only JSON access to current poi data",
+    "icon": "fa/server",
+    "priority": 50
+  }
+}
