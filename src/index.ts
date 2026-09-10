@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { JsonServer } from './server'
 import {
   applySettings,
@@ -42,10 +42,29 @@ function hostFromPoiWindow(): PluginHost {
   if (!hostWindow || typeof hostWindow.getStore !== 'function' || !hostWindow.config) {
     throw new Error('poi host APIs window.getStore and window.config are required.')
   }
+  let previousState = hostWindow.getStore()
+  const listeners = new Set<() => void>()
+  const poll = (): void => {
+    const nextState = hostWindow.getStore()
+    if (nextState === previousState) return
+    previousState = nextState
+    for (const listener of listeners) listener()
+  }
+  let timer: ReturnType<typeof setInterval> | null = null
   return {
     store: {
       getState: () => hostWindow.getStore(),
-      subscribe: () => () => undefined,
+      subscribe: (listener) => {
+        listeners.add(listener)
+        timer ??= setInterval(poll, 100)
+        return () => {
+          listeners.delete(listener)
+          if (listeners.size === 0 && timer !== null) {
+            clearInterval(timer)
+            timer = null
+          }
+        }
+      },
     },
     config: hostWindow.config,
   }
@@ -166,6 +185,7 @@ export const settingsClass: React.FC = () => {
   const [port, setPort] = useState(String(8765))
   const [token, setToken] = useState<string | null>(null)
   const [message, setMessage] = useState('')
+  const draftDirty = useRef(false)
 
   useEffect(() => {
     let active = true
@@ -173,8 +193,10 @@ export const settingsClass: React.FC = () => {
       if (!active) return
       try {
         const nextSettings = runtime.getSettings()
-        setSettings(nextSettings)
-        setPort(String(nextSettings.port))
+        if (!draftDirty.current) {
+          setSettings(nextSettings)
+          setPort(String(nextSettings.port))
+        }
         setStatus(runtime.getStatus())
       } catch {
         setMessage('The server is not loaded yet.')
@@ -201,6 +223,7 @@ export const settingsClass: React.FC = () => {
     void runtime
       .updateSettings({ enabled: settings.enabled, allowLan: settings.allowLan, port: parsedPort })
       .then((next) => {
+        draftDirty.current = false
         setSettings(next)
         setStatus(runtime.getStatus())
         setMessage('Settings saved.')
@@ -215,7 +238,7 @@ export const settingsClass: React.FC = () => {
       .rotateToken()
       .then((nextToken) => {
         setToken(nextToken)
-        setSettings(runtime.getSettings())
+        if (!draftDirty.current) setSettings(runtime.getSettings())
         setStatus(runtime.getStatus())
         setMessage(
           'Token rotated. Store this token in your trusted client now; it is not shown again.',
@@ -236,8 +259,12 @@ export const settingsClass: React.FC = () => {
       React.createElement('input', {
         type: 'checkbox',
         checked: settings.enabled,
-        onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
-          setSettings({ ...settings, enabled: event.target.checked }),
+        onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+          draftDirty.current = true
+          setSettings((current) =>
+            current ? { ...current, enabled: event.target.checked } : current,
+          )
+        },
       }),
       ' Enable server',
     ),
@@ -253,7 +280,10 @@ export const settingsClass: React.FC = () => {
           min: 1,
           max: 65535,
           value: port,
-          onChange: (event: React.ChangeEvent<HTMLInputElement>) => setPort(event.target.value),
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+            draftDirty.current = true
+            setPort(event.target.value)
+          },
         }),
       ),
     ),
@@ -263,8 +293,12 @@ export const settingsClass: React.FC = () => {
       React.createElement('input', {
         type: 'checkbox',
         checked: settings.allowLan,
-        onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
-          setSettings({ ...settings, allowLan: event.target.checked }),
+        onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+          draftDirty.current = true
+          setSettings((current) =>
+            current ? { ...current, allowLan: event.target.checked } : current,
+          )
+        },
       }),
       ' Allow LAN access',
     ),

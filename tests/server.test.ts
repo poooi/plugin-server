@@ -1,5 +1,7 @@
 import { request as httpRequest } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
+import { createElement } from 'react'
+import { act, create } from 'react-test-renderer'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   createPlugin,
@@ -7,6 +9,7 @@ import {
   pluginDidLoad,
   pluginWillUnload,
   publicSettings,
+  settingsClass,
   snapshotFor,
   type PluginHost,
 } from '../dist/index.js'
@@ -96,6 +99,10 @@ function fixture(): { state: unknown; store: Store; config: Config; host: Plugin
   return { state: store.state, store, config, host }
 }
 
+async function wait(milliseconds: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
 async function makePlugin() {
   const { store, config, host } = fixture()
   const port = await freePort()
@@ -175,8 +182,17 @@ describe('built poi plugin entry over real loopback HTTP', () => {
         'token' in saved &&
         typeof saved.token === 'string',
     ).toBe(true)
+    store.update({})
+    await wait(150)
+    const lifecycleToken =
+      typeof saved === 'object' && saved !== null && 'token' in saved ? saved.token : undefined
+    expect(
+      typeof lifecycleToken === 'string'
+        ? (await request(port, '/api/v1/snapshot', lifecycleToken)).body.revision
+        : -1,
+    ).toBe(1)
     pluginWillUnload()
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    await wait(20)
     delete (globalThis as unknown as { window?: unknown }).window
   })
 
@@ -207,6 +223,7 @@ describe('built poi plugin entry over real loopback HTTP', () => {
     const { token, port } = await makePlugin()
     expect((await request(port, '/api/v1', undefined)).status).toBe(401)
     expect((await request(port, '/api/v1', 'wrong-token')).status).toBe(401)
+    expect((await request(port, `/api/v1?token=${token}`, undefined)).status).toBe(401)
     expect((await request(port, `/api/v1?token=${token}`, token)).status).toBe(400)
     expect((await request(port, `/api/v1?access_token=${token}`, token)).status).toBe(400)
     expect((await request(port, '/api/v1', token, { Host: 'attacker.example' })).status).toBe(403)
@@ -285,5 +302,84 @@ describe('built projection and settings entry', () => {
     const settings = defaultSettings()
     expect(settings.token).toHaveLength(43)
     expect(publicSettings(settings)).not.toHaveProperty('token')
+  })
+
+  it('renders settings and keeps edits stable until the user saves them', async () => {
+    const { store, config } = fixture()
+    const port = await freePort()
+    let nextPort = await freePort()
+    while (nextPort === port) nextPort = await freePort()
+    config.set('plugin.poi-plugin-server.settings', { enabled: false, port, allowLan: false })
+    ;(globalThis as unknown as { window?: unknown }).window = {
+      getStore: () => store.getState(),
+      config,
+    }
+    pluginDidLoad()
+    await wait(20)
+
+    let renderer: ReturnType<typeof create> | undefined
+    await act(async () => {
+      renderer = create(createElement(settingsClass))
+      await wait(0)
+    })
+    if (!renderer) throw new Error('settings renderer was not created')
+    const inputs = (): Array<{ props: Record<string, unknown> }> =>
+      renderer?.root.findAllByType('input') ?? []
+    const buttons = (): Array<{ props: Record<string, unknown> }> =>
+      renderer?.root.findAllByType('button') ?? []
+    const [enabledInput, portInput, allowLanInput] = inputs()
+    if (!enabledInput || !portInput || !allowLanInput) throw new Error('settings inputs missing')
+
+    await act(async () => {
+      ;(enabledInput.props.onChange as (event: { target: { checked: boolean } }) => void)({
+        target: { checked: true },
+      })
+      ;(portInput.props.onChange as (event: { target: { value: string } }) => void)({
+        target: { value: String(nextPort) },
+      })
+      ;(allowLanInput.props.onChange as (event: { target: { checked: boolean } }) => void)({
+        target: { checked: true },
+      })
+      await wait(650)
+    })
+    expect(inputs()[0]?.props.checked).toBe(true)
+    expect(inputs()[1]?.props.value).toBe(String(nextPort))
+    expect(inputs()[2]?.props.checked).toBe(true)
+
+    const saveButton = buttons()[0]
+    if (!saveButton) throw new Error('save button missing')
+    await act(async () => {
+      ;(saveButton.props.onClick as () => void)()
+      await wait(20)
+    })
+    expect(config.get('plugin.poi-plugin-server.settings')).toMatchObject({
+      enabled: true,
+      port: nextPort,
+      allowLan: true,
+    })
+    renderer.unmount()
+    pluginWillUnload()
+    await wait(20)
+    delete (globalThis as unknown as { window?: unknown }).window
+  })
+
+  it('accepts the exact loopback headers used by the documented TLS proxy', async () => {
+    const { token, port } = await makePlugin()
+    expect(
+      (
+        await request(port, '/api/v1', token, {
+          Host: `127.0.0.1:${port}`,
+          Origin: `http://127.0.0.1:${port}`,
+        })
+      ).status,
+    ).toBe(200)
+    expect(
+      (
+        await request(port, '/api/v1', token, {
+          Host: `127.0.0.1:${port}`,
+          Origin: `https://localhost`,
+        })
+      ).status,
+    ).toBe(403)
   })
 })

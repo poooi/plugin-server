@@ -148,7 +148,7 @@ export class JsonServer {
         this.settings.allowLan !== settings.allowLan
       this.settings = settings
       this._status = { ...this._status, configuredPort: settings.port }
-      if (!listenerChanged && this.server) return
+      if (!listenerChanged && this.server && this._status.phase === 'running') return
       await this.stopNow()
       await this.startNow()
     })
@@ -197,7 +197,6 @@ export class JsonServer {
         boundPort: null,
         address: null,
       }
-      this.server = null
     })
     await new Promise<void>((resolve, reject) => {
       const onListening = (): void => {
