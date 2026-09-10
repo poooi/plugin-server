@@ -4,6 +4,8 @@ import { createElement } from 'react'
 import { act, create } from 'react-test-renderer'
 import { afterEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import {
   createPlugin,
   defaultSettings,
@@ -61,8 +63,10 @@ class Config {
 }
 
 const plugins: Array<Awaited<ReturnType<typeof createPlugin>>> = []
+const mcpClients: Array<Client> = []
 
 afterEach(async () => {
+  for (const client of mcpClients.splice(0)) await client.close()
   for (const plugin of plugins.splice(0)) await plugin.unload()
 })
 
@@ -129,6 +133,17 @@ async function makePlugin() {
   return { plugin, store, config, token: saved.token, port }
 }
 
+async function makeMcpClient(port: number, token: string): Promise<Client> {
+  const client = new Client({ name: 'poi-plugin-server-test-client', version: '1.0.0' })
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`http://127.0.0.1:${port}/api/v1/mcp`),
+    { requestInit: { headers: { Authorization: `Bearer ${token}` } } },
+  )
+  await client.connect(transport)
+  mcpClients.push(client)
+  return client
+}
+
 async function request(
   port: number,
   path: string,
@@ -183,6 +198,20 @@ function socketText(data: WebSocket.RawData): string {
   if (Array.isArray(data)) return Buffer.concat(data).toString('utf8')
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8')
   return Buffer.from(data).toString('utf8')
+}
+
+function contentText(value: unknown): string {
+  if (typeof value !== 'object' || value === null || !('text' in value)) {
+    throw new Error('MCP response did not contain text content.')
+  }
+  const text = value.text
+  if (typeof text !== 'string') throw new Error('MCP response text was not a string.')
+  return text
+}
+
+function firstContentText(value: unknown): string {
+  if (!Array.isArray(value)) throw new Error('MCP response did not contain content.')
+  return contentText(value[0])
 }
 
 function connectSocket(
@@ -453,6 +482,101 @@ describe('built poi plugin entry over real loopback WebSocket', () => {
         socket.once('error', reject)
       }),
     ).rejects.toThrow('403')
+  })
+})
+
+describe('built poi plugin entry over the official MCP SDK', () => {
+  it('initializes, discovers, reads and follows changing allowlisted data', async () => {
+    const { store, token, port } = await makePlugin()
+    const client = await makeMcpClient(port, token)
+
+    const resources = await client.listResources()
+    expect(resources.resources.map((resource) => resource.uri)).toEqual([
+      'poi://snapshot',
+      'poi://data/ships',
+      'poi://data/equipment',
+      'poi://data/fleets',
+      'poi://data/resources',
+      'poi://data/docks',
+      'poi://data/masterData',
+    ])
+    const tools = await client.listTools()
+    expect(tools.tools.map((tool) => tool.name)).toEqual([
+      'read_poi_snapshot',
+      'read_poi_ships',
+      'read_poi_equipment',
+      'read_poi_fleets',
+      'read_poi_resources',
+      'read_poi_docks',
+      'read_poi_masterData',
+    ])
+
+    const first = await client.readResource({ uri: 'poi://data/ships' })
+    const firstShips = JSON.parse(contentText(first.contents[0])) as Record<string, unknown>
+    expect(firstShips.items).toEqual([
+      { id: 1, shipId: 1, name: 'Fubuki', type: 1, level: 12, hp: 18 },
+    ])
+    const firstTool = await client.callTool({ name: 'read_poi_ships', arguments: {} })
+    expect(JSON.parse(firstContentText(firstTool.content))).toMatchObject({
+      dataset: 'ships',
+      items: [{ id: 1, level: 12 }],
+    })
+
+    store.update({
+      info: { ships: { '1': { api_id: 1, api_ship_id: 1, api_lv: 13, api_nowhp: 17 } } },
+      const: { $ships: { '1': { api_id: 1, api_name: 'Fubuki', api_stype: 1 } } },
+    })
+    const changed = await client.readResource({ uri: 'poi://data/ships' })
+    expect(JSON.parse(contentText(changed.contents[0]))).toMatchObject({
+      dataset: 'ships',
+      items: [{ id: 1, level: 13, hp: 17 }],
+    })
+  })
+
+  it('rejects unauthorized, URL-credential, invalid host/origin and unknown MCP requests', async () => {
+    const { token, port } = await makePlugin()
+    const unauthorized = new Client({ name: 'unauthorized', version: '1.0.0' })
+    const unauthorizedTransport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${port}/api/v1/mcp`),
+    )
+    await expect(unauthorized.connect(unauthorizedTransport)).rejects.toThrow()
+    await unauthorized.close()
+
+    expect((await request(port, `/api/v1/mcp?token=${token}`, undefined)).status).toBe(401)
+    expect((await request(port, `/api/v1/mcp?token=${token}`, token)).status).toBe(400)
+    expect((await request(port, '/api/v1/mcp', token, { Host: 'attacker.example' })).status).toBe(
+      403,
+    )
+    expect(
+      (await request(port, '/api/v1/mcp', token, { Origin: `http://attacker.example:${port}` }))
+        .status,
+    ).toBe(403)
+
+    const client = await makeMcpClient(port, token)
+    await expect(
+      client.callTool({ name: 'not_a_real_tool', arguments: {} }),
+    ).resolves.toMatchObject({
+      isError: true,
+      content: [{ type: 'text' }],
+    })
+  })
+
+  it('invalidates sessions on rotation and unload while accepting the replacement token', async () => {
+    const { plugin, token, port } = await makePlugin()
+    const client = await makeMcpClient(port, token)
+    await client.listTools()
+    const replacement = await plugin.rotateToken()
+    await expect(client.listTools()).rejects.toThrow()
+    const replacementClient = await makeMcpClient(port, replacement)
+    expect((await replacementClient.listTools()).tools.length).toBe(7)
+    const disabled = replacementClient.listTools()
+    await plugin.updateSettings({ enabled: false })
+    await expect(disabled).rejects.toThrow()
+    await plugin.updateSettings({ enabled: true })
+    const reloadedClient = await makeMcpClient(port, replacement)
+    expect((await reloadedClient.listResources()).resources.length).toBe(7)
+    await plugin.unload()
+    await expect(reloadedClient.listTools()).rejects.toThrow()
   })
 })
 

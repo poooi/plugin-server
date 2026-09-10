@@ -15,7 +15,8 @@ export const SETTINGS_DESCRIPTOR: readonly SettingsDescriptor[] = [
   {
     key: 'enabled',
     label: 'Enable server',
-    description: 'Start the authenticated read-only JSON and WebSocket server when poi loads.',
+    description:
+      'Start the authenticated read-only JSON, WebSocket, and MCP server when poi loads.',
   },
   {
     key: 'port',
