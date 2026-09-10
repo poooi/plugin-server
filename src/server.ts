@@ -1,7 +1,9 @@
-import { timingSafeEqual } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { isIP } from 'node:net'
 import type { Duplex } from 'node:stream'
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { WebSocket, WebSocketServer } from 'ws'
 import { allSnapshots, snapshotFor } from './projection'
 import {
@@ -18,6 +20,7 @@ const MAX_WS_INCOMING_BYTES = 8192
 const MAX_WS_MESSAGE_BYTES = 1024 * 1024
 const MAX_WS_BUFFERED_BYTES = 1024 * 1024
 const WS_PATH = '/api/v1/subscribe'
+const MCP_PATH = '/api/v1/mcp'
 
 function isDataset(value: string): value is DatasetName {
   return (DATASET_NAMES as readonly string[]).includes(value)
@@ -136,6 +139,7 @@ export class JsonServer {
     perMessageDeflate: false,
   })
   private readonly sockets = new Set<WebSocket>()
+  private readonly mcpSessions = new Map<string, McpSession>()
   private unsubscribe: (() => void) | null = null
   private lifecycle: Promise<void> = Promise.resolve()
   private revision = 0
@@ -177,7 +181,10 @@ export class JsonServer {
         this.settings.allowLan !== settings.allowLan
       this.settings = settings
       this._status = { ...this._status, configuredPort: settings.port }
-      if (tokenChanged) this.closeSockets()
+      if (tokenChanged) {
+        this.closeSockets()
+        await this.closeMcpSessions()
+      }
       if (!listenerChanged && this.server && this._status.phase === 'running') return
       await this.stopNow()
       await this.startNow()
@@ -267,6 +274,7 @@ export class JsonServer {
     const server = this.server
     this.server = null
     this.closeSockets()
+    await this.closeMcpSessions()
     if (server) {
       server.closeAllConnections()
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -389,10 +397,6 @@ export class JsonServer {
       sendJson(response, 413, { error: 'request_too_large' }, origin)
       return
     }
-    if (request.method !== 'GET') {
-      sendJson(response, 405, { error: 'method_not_allowed' }, origin)
-      return
-    }
     let parsedUrl: URL
     try {
       parsedUrl = new URL(request.url, 'http://localhost')
@@ -402,6 +406,14 @@ export class JsonServer {
     }
     if (hasUrlCredential(parsedUrl)) {
       sendJson(response, 400, { error: 'token_in_url_not_allowed' }, origin)
+      return
+    }
+    if (parsedUrl.pathname === MCP_PATH) {
+      void this.handleMcp(request, response)
+      return
+    }
+    if (request.method !== 'GET') {
+      sendJson(response, 405, { error: 'method_not_allowed' }, origin)
       return
     }
     const segments = parsedUrl.pathname.split('/').filter(Boolean)
@@ -438,4 +450,121 @@ export class JsonServer {
     }
     sendJson(response, 404, { error: 'not_found' }, origin)
   }
+
+  private createMcpSession(): McpSession {
+    const server = new McpServer({ name: 'poi-plugin-server', version: '0.2.0' })
+    const snapshot = (): string =>
+      JSON.stringify({
+        schemaVersion: 1,
+        revision: this.revision,
+        datasets: allSnapshots(this.host.store.getState()),
+      })
+    const dataset = (name: DatasetName): string =>
+      JSON.stringify(snapshotFor(name, this.host.store.getState()))
+
+    server.registerResource(
+      'poi-snapshot',
+      'poi://snapshot',
+      {
+        description: 'The current versioned allowlisted poi projection.',
+        mimeType: 'application/json',
+      },
+      (uri) => ({ contents: [{ uri: uri.href, text: snapshot(), mimeType: 'application/json' }] }),
+    )
+    for (const name of DATASET_NAMES) {
+      server.registerResource(
+        `poi-${name}`,
+        `poi://data/${name}`,
+        {
+          description: `The current allowlisted ${name} projection from poi.`,
+          mimeType: 'application/json',
+        },
+        (uri) => ({
+          contents: [{ uri: uri.href, text: dataset(name), mimeType: 'application/json' }],
+        }),
+      )
+    }
+
+    server.registerTool(
+      'read_poi_snapshot',
+      {
+        title: 'Read poi snapshot',
+        description: 'Read the complete current allowlisted poi projection as JSON.',
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      () => ({ content: [{ type: 'text', text: snapshot() }] }),
+    )
+    for (const name of DATASET_NAMES) {
+      server.registerTool(
+        `read_poi_${name}`,
+        {
+          title: `Read poi ${name}`,
+          description: `Read the current allowlisted ${name} projection as JSON.`,
+          annotations: { readOnlyHint: true, openWorldHint: false },
+        },
+        () => ({ content: [{ type: 'text', text: dataset(name) }] }),
+      )
+    }
+
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID })
+    const session: McpSession = { server, transport }
+    transport.onclose = () => {
+      const sessionId = transport.sessionId
+      if (sessionId && this.mcpSessions.get(sessionId) === session)
+        this.mcpSessions.delete(sessionId)
+    }
+    return session
+  }
+
+  private async handleMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (request.method !== 'POST' && request.method !== 'GET' && request.method !== 'DELETE') {
+      sendJson(response, 405, { error: 'method_not_allowed' }, request.headers.origin)
+      return
+    }
+    const sessionIdHeader = request.headers['mcp-session-id']
+    const sessionId = Array.isArray(sessionIdHeader) ? undefined : sessionIdHeader
+    let session = sessionId ? this.mcpSessions.get(sessionId) : undefined
+    if (!session && sessionId) {
+      sendJson(response, 404, { error: 'mcp_session_not_found' }, request.headers.origin)
+      return
+    }
+    if (!session) {
+      if (request.method !== 'POST') {
+        sendJson(response, 400, { error: 'mcp_session_required' }, request.headers.origin)
+        return
+      }
+      session = this.createMcpSession()
+      await session.server.connect(session.transport)
+    }
+    const isNewSession = !sessionId
+    try {
+      await session.transport.handleRequest(request, response)
+      if (isNewSession) {
+        const establishedId = session.transport.sessionId
+        if (establishedId) this.mcpSessions.set(establishedId, session)
+        else await session.server.close()
+      }
+    } catch (error: unknown) {
+      if (!response.headersSent) {
+        sendJson(
+          response,
+          500,
+          { error: error instanceof Error ? error.message : 'MCP request failed.' },
+          request.headers.origin,
+        )
+      }
+      await session.server.close()
+    }
+  }
+
+  private async closeMcpSessions(): Promise<void> {
+    const sessions = [...this.mcpSessions.values()]
+    this.mcpSessions.clear()
+    await Promise.all(sessions.map((session) => session.server.close()))
+  }
+}
+
+interface McpSession {
+  server: McpServer
+  transport: StreamableHTTPServerTransport
 }
